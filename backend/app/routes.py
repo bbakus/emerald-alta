@@ -7,7 +7,7 @@ from flask import request, abort
 from flask_restful import Resource, reqparse
 from flask_jwt_extended import create_access_token, jwt_required, get_jwt_identity
 from .models import User, Character, Class_, Item, Inventory, Enemy, Move, Quest, ChatMessage
-from .db import Session
+from .db import Session, session_scope
 from werkzeug.security import generate_password_hash, check_password_hash
 from marshmallow import Schema, fields
 from sqlalchemy.orm.exc import NoResultFound
@@ -606,23 +606,22 @@ class InventoryList(Resource):
 class CharacterInventory(Resource):
     @jwt_required()
     def get(self, character_id):
-        session = Session()
-        
-        character = session.query(Character).filter_by(id=character_id).first()
-        if not character:
-            return {'message': 'Character not found'}, 404
+        with session_scope() as session:
+            character = session.query(Character).filter_by(id=character_id).first()
+            if not character:
+                return {'message': 'Character not found'}, 404
+                
+            inventories = session.query(Inventory).filter_by(character_id=character_id).all()
+            items = []
             
-        inventories = session.query(Inventory).filter_by(character_id=character_id).all()
-        items = []
-        
-        for inventory in inventories:
-            item = session.query(Item).filter_by(id=inventory.item_id).first()
-            if item:
-                item_data = item_schema.dump(item)
-                item_data['inventory_id'] = inventory.id
-                items.append(item_data)
-        
-        return items, 200
+            for inventory in inventories:
+                item = session.query(Item).filter_by(id=inventory.item_id).first()
+                if item:
+                    item_data = item_schema.dump(item)
+                    item_data['inventory_id'] = inventory.id
+                    items.append(item_data)
+            
+            return items, 200
 
 # Enemy Resources
 class EnemyResource(Resource):
@@ -930,41 +929,40 @@ class ChatCompletion(Resource):
     def post(self):
         try:
             data = request.get_json()
-            session = Session()
-            
             character_id = data.get('character_id')
-            character = None
             
-            if character_id:
-                character = session.query(Character).filter_by(id=character_id).first()
-                if not character:
-                    return {'message': 'Character not found'}, 404
-            
-            # Get chat history
-            messages = []
-            if character:
-                chat_messages = session.query(ChatMessage).filter_by(character_id=character_id).order_by(ChatMessage.timestamp).all()
-                messages = chat_messages_schema.dump(chat_messages)
-            
-            # Generate AI response
-            ai_response = openai_service.generate_response(messages, character)
-            
-            # Save AI response to database
-            if character:
-                new_message = ChatMessage(
-                    content=ai_response,
-                    is_user=False,
-                    character_id=character_id
-                )
-                session.add(new_message)
-                session.commit()
+            with session_scope() as session:
+                character = None
                 
-                # Return the saved message
-                return chat_message_schema.dump(new_message), 201
-            
-            # If no character, just return the response
-            return {'content': ai_response}, 200
-            
+                if character_id:
+                    character = session.query(Character).filter_by(id=character_id).first()
+                    if not character:
+                        return {'message': 'Character not found'}, 404
+                
+                # Get chat history
+                messages = []
+                if character:
+                    chat_messages = session.query(ChatMessage).filter_by(character_id=character_id).order_by(ChatMessage.timestamp).all()
+                    messages = chat_messages_schema.dump(chat_messages)
+                
+                # Generate AI response
+                ai_response = openai_service.generate_response(messages, character)
+                
+                # Save AI response to database
+                if character:
+                    new_message = ChatMessage(
+                        content=ai_response,
+                        is_user=False,
+                        character_id=character_id
+                    )
+                    session.add(new_message)
+                    
+                    # Return the saved message
+                    return chat_message_schema.dump(new_message), 201
+                
+                # If no character, just return the response
+                return {'content': ai_response}, 200
+                
         except Exception as e:
             print(f"Error generating AI response: {str(e)}")
             return {'message': f'Server error: {str(e)}'}, 500
@@ -1224,77 +1222,96 @@ class EquipItem(Resource):
     @jwt_required()
     def post(self, item_id):
         try:
-            session = Session()
+            print(f"\n\n------------------------------")
+            print(f"Equip request received for item_id: {item_id}")
             
-            # Get data from request
-            data = request.get_json()
+            # Debug the request
+            print(f"Request data: {request.data}")
+            print(f"Request json: {request.json if request.is_json else 'No JSON data'}")
+            print(f"Request headers: {dict(request.headers)}")
+            
+            data = request.get_json() if request.is_json else {}
             character_id = data.get('character_id')
             
+            print(f"Extracted character_id: {character_id}")
+            
             if not character_id:
+                print("No character_id provided")
                 return {'message': 'Character ID is required'}, 400
                 
-            # Verify character exists
-            character = session.query(Character).filter_by(id=character_id).first()
-            if not character:
-                return {'message': 'Character not found'}, 404
+            with session_scope() as session:
+                # Verify character exists
+                character = session.query(Character).filter_by(id=character_id).first()
+                if not character:
+                    print(f"Character not found: {character_id}")
+                    return {'message': 'Character not found'}, 404
+                    
+                # Verify the item exists
+                item = session.query(Item).filter_by(id=item_id).first()
+                if not item:
+                    print(f"Item not found: {item_id}")
+                    return {'message': 'Item not found'}, 404
+                    
+                # Verify the character has this item in inventory
+                inventory = session.query(Inventory).filter_by(character_id=character_id, item_id=item_id).first()
+                if not inventory:
+                    print(f"Item {item_id} not in character {character_id} inventory")
+                    return {'message': 'Item not in character inventory'}, 404
+                    
+                # Verify the item is equippable
+                if not item.equippable:
+                    print(f"Item {item_id} is not equippable, marking it as equippable")
+                    item.equippable = True
+                    
+                # Unequip any currently equipped items of the same type if equipping
+                if not item.is_equipped:
+                    print(f"Unequipping other items of type: {item.type}")
+                    currently_equipped = session.query(Item).join(Inventory).filter(
+                        Inventory.character_id == character_id,
+                        Item.type == item.type,
+                        Item.is_equipped == True
+                    ).all()
+                    
+                    for equipped_item in currently_equipped:
+                        print(f"Unequipping item: {equipped_item.id} ({equipped_item.name})")
+                        equipped_item.is_equipped = False
                 
-            # Verify the item exists
-            item = session.query(Item).filter_by(id=item_id).first()
-            if not item:
-                return {'message': 'Item not found'}, 404
+                # Toggle the equipped status
+                item.is_equipped = not item.is_equipped
+                print(f"Item {item_id} is now {'equipped' if item.is_equipped else 'unequipped'}")
                 
-            # Verify the character has this item in inventory
-            inventory = session.query(Inventory).filter_by(character_id=character_id, item_id=item_id).first()
-            if not inventory:
-                return {'message': 'Item not in character inventory'}, 404
+                # Return result after committing (session.commit happens automatically in the context manager)
+                result = {
+                    'message': f"Item {'equipped' if item.is_equipped else 'unequipped'} successfully",
+                    'item_id': item.id,
+                    'is_equipped': item.is_equipped
+                }
+                print(f"Returning result: {result}")
+                print(f"------------------------------\n\n")
+                return result, 200
                 
-            # Verify the item is equippable
-            if not item.equippable:
-                return {'message': 'Item is not equippable'}, 400
-                
-            # Unequip any currently equipped items of the same type if equipping
-            if not item.is_equipped:
-                currently_equipped = session.query(Item).join(Inventory).filter(
-                    Inventory.character_id == character_id,
-                    Item.type == item.type,
-                    Item.is_equipped == True
-                ).all()
-                
-                for equipped_item in currently_equipped:
-                    equipped_item.is_equipped = False
-            
-            # Toggle the equipped status
-            item.is_equipped = not item.is_equipped
-            
-            session.commit()
-            
-            return {
-                'message': f"Item {'equipped' if item.is_equipped else 'unequipped'} successfully",
-                'item_id': item.id,
-                'is_equipped': item.is_equipped
-            }, 200
-            
         except Exception as e:
             print(f"Error equipping item: {str(e)}")
+            import traceback
+            traceback.print_exc()
             return {'message': f'Error: {str(e)}'}, 500
 
 # List equipped items
 class CharacterEquipment(Resource):
     @jwt_required()
     def get(self, character_id):
-        session = Session()
-        
-        character = session.query(Character).filter_by(id=character_id).first()
-        if not character:
-            return {'message': 'Character not found'}, 404
+        with session_scope() as session:
+            character = session.query(Character).filter_by(id=character_id).first()
+            if not character:
+                return {'message': 'Character not found'}, 404
+                
+            # Get equipped items
+            equipped_items = session.query(Item).join(Inventory).filter(
+                Inventory.character_id == character_id,
+                Item.is_equipped == True
+            ).all()
             
-        # Get equipped items
-        equipped_items = session.query(Item).join(Inventory).filter(
-            Inventory.character_id == character_id,
-            Item.is_equipped == True
-        ).all()
-        
-        return items_schema.dump(equipped_items), 200
+            return items_schema.dump(equipped_items), 200
 
 # ===================
 # Route Registration

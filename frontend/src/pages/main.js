@@ -452,12 +452,92 @@ function Main() {
 
   // Add the handleEquipItem function
   const handleEquipItem = async () => {
-    if (!selectedItem || !character) return;
+    if (!selectedItem || !character) {
+      console.error("Cannot equip: No selected item or character");
+      return;
+    }
+    
+    console.log("Equipping item:", selectedItem);
+    console.log("Character ID:", character.id);
+    
+    try {
+      const token = localStorage.getItem('token');
+      console.log("Using token:", token ? "Token exists" : "No token found");
+      
+      const response = await fetch(`http://127.0.0.1:5000/api/items/${selectedItem.id}/equip`, {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${token}`,
+          'Content-Type': 'application/json',
+          'Accept': 'application/json'
+        },
+        body: JSON.stringify({
+          character_id: character.id
+        })
+      });
+      
+      console.log("Equip response status:", response.status);
+      
+      if (response.ok) {
+        const result = await response.json();
+        console.log('Equip result:', result);
+        
+        // Update the selected item
+        setSelectedItem({
+          ...selectedItem,
+          is_equipped: result.is_equipped
+        });
+        
+        // Refresh inventory and equipment lists
+        const token = localStorage.getItem('token');
+        
+        const inventoryResponse = await fetch(`http://127.0.0.1:5000/api/characters/${character.id}/inventory`, {
+          headers: {
+            'Authorization': `Bearer ${token}`,
+            'Accept': 'application/json'
+          }
+        });
+        
+        if (inventoryResponse.ok) {
+          const inventoryData = await inventoryResponse.json();
+          setInventoryItems(inventoryData);
+        }
+        
+        const equipmentResponse = await fetch(`http://127.0.0.1:5000/api/characters/${character.id}/equipment`, {
+          headers: {
+            'Authorization': `Bearer ${token}`,
+            'Accept': 'application/json'
+          }
+        });
+        
+        if (equipmentResponse.ok) {
+          const equipmentData = await equipmentResponse.json();
+          setEquippedItems(equipmentData);
+        }
+      } else {
+        console.error('Failed to equip item:', response.status);
+        // Try to get the error message from the response
+        try {
+          const errorData = await response.json();
+          console.error('Error details:', errorData);
+        } catch (err) {
+          console.error('Could not parse error response');
+        }
+      }
+    } catch (err) {
+      console.error('Error equipping item:', err);
+    }
+  };
+
+  // Add function to handle equipping items directly from inventory list
+  const handleEquipItemFromList = async (e, item) => {
+    e.stopPropagation(); // Prevent opening the modal
+    if (!item || !character) return;
     
     try {
       const token = localStorage.getItem('token');
       
-      const response = await fetch(`http://127.0.0.1:5000/api/items/${selectedItem.id}/equip`, {
+      const response = await fetch(`http://127.0.0.1:5000/api/items/${item.id}/equip`, {
         method: 'POST',
         headers: {
           'Authorization': `Bearer ${token}`,
@@ -473,15 +553,7 @@ function Main() {
         const result = await response.json();
         console.log('Equip result:', result);
         
-        // Update the selected item
-        setSelectedItem({
-          ...selectedItem,
-          is_equipped: result.is_equipped
-        });
-        
         // Refresh inventory and equipment lists
-        const token = localStorage.getItem('token');
-        
         const inventoryResponse = await fetch(`http://127.0.0.1:5000/api/characters/${character.id}/inventory`, {
           headers: {
             'Authorization': `Bearer ${token}`,
@@ -584,6 +656,14 @@ function Main() {
                     {item.intelligence > 0 && <div className="item-stat">INT: +{item.intelligence}</div>}
                     {item.wisdom > 0 && <div className="item-stat">WIS: +{item.wisdom}</div>}
                     {item.charisma > 0 && <div className="item-stat">CHA: +{item.charisma}</div>}
+                    {item.equippable && (
+                      <button 
+                        className="equip-button-list"
+                        onClick={(e) => handleEquipItemFromList(e, item)}
+                      >
+                        {item.is_equipped ? "Unequip" : "Equip"}
+                      </button>
+                    )}
                   </div>
                 ))}
               </div>
@@ -616,6 +696,12 @@ function Main() {
                     {item.intelligence > 0 && <div className="item-stat">INT: +{item.intelligence}</div>}
                     {item.wisdom > 0 && <div className="item-stat">WIS: +{item.wisdom}</div>}
                     {item.charisma > 0 && <div className="item-stat">CHA: +{item.charisma}</div>}
+                    <button 
+                      className="equip-button-list"
+                      onClick={(e) => handleEquipItemFromList(e, item)}
+                    >
+                      Unequip
+                    </button>
                   </div>
                 ))}
               </div>
@@ -1019,14 +1105,12 @@ function Main() {
             </div>
             
             <div className="modal-footer">
-              {selectedItem.equippable && (
-                <button 
-                  className="equip-button"
-                  onClick={handleEquipItem}
-                >
-                  {selectedItem.is_equipped ? "Unequip" : "Equip"}
-                </button>
-              )}
+              <button 
+                className="equip-button"
+                onClick={handleEquipItem}
+              >
+                {selectedItem.is_equipped ? "Unequip" : "Equip"}
+              </button>
               <button className="close-button" onClick={handleCloseModal}>Close</button>
             </div>
           </div>

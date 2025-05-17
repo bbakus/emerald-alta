@@ -22,7 +22,7 @@ app.config['JWT_HEADER_NAME'] = 'Authorization'
 app.config['JWT_HEADER_TYPE'] = 'Bearer'
 
 # Enable CORS - configure for all routes (not just /api/)
-CORS(app, origins="http://localhost:3000", supports_credentials=True)
+CORS(app, origins=["http://localhost:3000", "http://127.0.0.1:3000"], supports_credentials=True)
 
 # Add CORS headers even for errors
 @app.errorhandler(500)

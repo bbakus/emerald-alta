@@ -7,7 +7,7 @@ import base64
 from datetime import datetime
 from dotenv import load_dotenv
 from ..models import Item, Inventory, Enemy, Move, NPC
-from ..db import Session
+from ..db import Session, session_scope
 
 # Load environment variables from .env file
 load_dotenv()
@@ -376,8 +376,6 @@ DO NOT include any explanations, only provide valid JSON."""
     def _process_item_giving(self, ai_response, character):
         """Process item giving from AI response"""
         import re
-        from ..models import Item, Inventory
-        from ..db import Session
         
         # Look for item tag pattern
         pattern = r'\[ITEM:(.*?)\|(.*?)\|(.*?)\]'
@@ -392,69 +390,84 @@ DO NOT include any explanations, only provide valid JSON."""
             print(f"AI is giving item: {item_name} ({item_type}) - {item_description}")
             
             try:
-                # Create a database session
-                session = Session()
-                
-                # Check if character already has an item with this name
-                # First, get all inventory items for the character
-                inventory_items = session.query(Inventory).filter_by(character_id=character.id).all()
-                
-                # Check if any of the inventory items have the same name
-                has_item = False
-                for inv in inventory_items:
-                    item = session.query(Item).filter_by(id=inv.item_id).first()
-                    if item and item.name.lower() == item_name.lower():
-                        print(f"Character already has item '{item_name}', skipping creation")
-                        has_item = True
-                        break
-                
-                # Only create the item if the character doesn't already have it
-                if not has_item:
-                    # Create the new item
-                    new_item = Item(
-                        name=item_name,
-                        type=item_type,
-                        weight=1,  # Default weight
-                        effect_description=item_description,
-                        lore_description="Given by the Dungeon Master",
-                        armor_class=0,
-                        str=0,
-                        dex=0,
-                        speed=0,
-                        wisdom=0,
-                        intelligence=0,
-                        constitution=0,
-                        charisma=0,
-                        initiative=0,
-                        equippable=True if item_type in ["weapon", "armor", "necklace", "trinket", "helm", "accessory"] else False,
-                        is_equipped=False
-                    )
+                # Use session context manager
+                with session_scope() as session:
+                    # Check if character already has an item with this name or similar name
+                    # First, get all inventory items for the character
+                    inventory_items = session.query(Inventory).filter_by(character_id=character.id).all()
                     
-                    # Generate image for the item
-                    try:
-                        image_url = self.generate_item_image(item_name, item_type, item_description)
-                        if image_url:
-                            new_item.image_url = image_url
-                    except Exception as img_err:
-                        print(f"Error generating image for item: {str(img_err)}")
+                    # Check if any of the inventory items have the same name or similar
+                    has_item = False
+                    for inv in inventory_items:
+                        item = session.query(Item).filter_by(id=inv.item_id).first()
+                        if item:
+                            # Check for exact match first
+                            if item.name.lower() == item_name.lower():
+                                print(f"Character already has item '{item_name}', skipping creation")
+                                has_item = True
+                                break
+                            
+                            # Check for partial match (if the name contains the other)
+                            if item_name.lower() in item.name.lower() or item.name.lower() in item_name.lower():
+                                print(f"Character already has similar item '{item.name}', skipping creation")
+                                has_item = True
+                                break
                     
-                    # Add item to database
-                    session.add(new_item)
-                    session.flush()  # Get the ID without committing
-                    
-                    # Add item to character's inventory
-                    new_inventory = Inventory(
-                        item_id=new_item.id,
-                        character_id=character.id
-                    )
-                    
-                    session.add(new_inventory)
-                    session.commit()
-                    
-                    print(f"Successfully added {item_name} to character inventory")
+                    # If the character doesn't have a similar item, create it
+                    if not has_item:
+                        # Create the new item
+                        new_item = Item(
+                            name=item_name,
+                            type=item_type,
+                            weight=1,  # Default weight
+                            effect_description=item_description,
+                            lore_description="An item found during your adventure.",
+                            equippable=item_type in ["weapon", "armor", "shield", "helm", "accessory", "trinket", "necklace"],
+                            is_equipped=False
+                        )
+                        
+                        # Add stats based on type
+                        if item_type == "weapon":
+                            new_item.str = random.randint(1, 3)
+                        elif item_type == "armor":
+                            new_item.armor_class = random.randint(1, 3)
+                        elif item_type == "shield":
+                            new_item.armor_class = random.randint(1, 2)
+                        elif item_type == "helm":
+                            new_item.armor_class = 1
+                            new_item.wisdom = random.randint(0, 1)
+                        elif item_type == "accessory":
+                            new_item.dex = random.randint(0, 2)
+                        elif item_type == "trinket":
+                            new_item.intelligence = random.randint(0, 2)
+                        elif item_type == "necklace":
+                            new_item.charisma = random.randint(0, 2)
+                        
+                        # Generate an image for the item
+                        try:
+                            image_url = self.generate_item_image(item_name, item_type, item_description)
+                            if image_url:
+                                new_item.image_url = image_url
+                        except Exception as img_err:
+                            print(f"Error generating image for item: {str(img_err)}")
+                        
+                        # Add item to database and get its ID
+                        session.add(new_item)
+                        session.flush()  # Get ID without committing
+                        
+                        # Add item to character's inventory
+                        new_inventory = Inventory(
+                            item_id=new_item.id,
+                            character_id=character.id
+                        )
+                        
+                        session.add(new_inventory)
+                        # Session is committed automatically by the context manager
+                        
+                        print(f"Successfully added item {item_name} to character's inventory")
                 
             except Exception as e:
-                print(f"Error giving item: {str(e)}")
+                print(f"Error adding item to inventory: {str(e)}")
             
             # Remove the item tag from the response
             ai_response = re.sub(pattern, '', ai_response).strip()
@@ -477,7 +490,7 @@ DO NOT include any explanations, only provide valid JSON."""
             return None
             
         # Enhanced prompt for higher detail
-        prompt = f"A highly detailed 16-bit pixel art image of a fantasy RPG {item_type}: {item_name}. The item should have fine details, shading, and highlights. High quality pixel art with detailed features, not 8-bit style. Item should be centered on a transparent or simple background."
+        prompt = f"A highly detailed 16-bit pixel art image of a fantasy RPG {item_type}: {item_name}. The item should have fine details, shading, and highlights with a colorful atmospheric background. High quality pixel art with detailed features, not 8-bit style. Make the background dark fantasy themed with mystic elements, not plain or transparent. Include Mesoamerican elements in the design."
         
         # Use the most minimal and reliable format for the API call
         headers = {
@@ -530,7 +543,7 @@ DO NOT include any explanations, only provide valid JSON."""
             return None
             
         # Enhanced prompt for higher detail
-        prompt = f"A highly detailed 16-bit pixel art portrait of a fantasy RPG character, {character_class}, with fine details and shading. High quality pixel art with detailed features, not 8-bit style. Character should have clear facial features and expressions."
+        prompt = f"A highly detailed 16-bit pixel art portrait of a fantasy RPG character, {character_class}, with fine details and shading. High quality pixel art with detailed features, not 8-bit style. Character should have clear facial features and expressions with a dark fantasy atmospheric background. Include Mesoamerican elements in the design and setting. The background should be colorful and thematic, not blank or white."
         
         # Use the most minimal and reliable format for the API call
         headers = {
@@ -894,7 +907,6 @@ Write a brief but compelling character backstory in 3-4 sentences maximum."""
     def _process_transaction(self, ai_response, character):
         """Process monetary transactions from AI response"""
         import re
-        from ..db import Session
         
         # Look for transaction tag pattern
         pattern = r'\[TRANSACTION:(.*?)\|(.*?)\]'
@@ -915,28 +927,51 @@ Write a brief but compelling character backstory in 3-4 sentences maximum."""
                 
                 print(f"Processing transaction: {description} for {amount} pesos")
                 
-                # Create a database session
-                session = Session()
+                # Use session context manager
+                with session_scope() as session:
+                    # Get the current character from the database
+                    current_character = session.query(character.__class__).filter_by(id=character.id).first()
+                    
+                    if not current_character:
+                        print(f"Character not found in database: {character.id}")
+                        return ai_response
+                    
+                    # Check if character has enough money
+                    if current_character.money < amount:
+                        print(f"Character does not have enough money: {current_character.money} < {amount}")
+                        # Remove the transaction tag but don't process the transaction
+                        ai_response = re.sub(pattern, '', ai_response).strip()
+                        return ai_response
+                    
+                    # Deduct money from character
+                    current_character.money -= amount
+                    
+                    # Try to extract item name from description if it's a purchase
+                    # This helps avoid duplicate items in inventory
+                    item_name = None
+                    purchase_matches = re.search(r'Purchase of (.*?)$', description)
+                    if purchase_matches:
+                        item_name = purchase_matches.group(1).strip()
+                        print(f"Detected item purchase: {item_name}")
+                        
+                        # Look for the item in the description to avoid duplicates
+                        words = description.lower().split()
+                        
+                        # Check if character already has an item with a similar name
+                        inventory_items = session.query(Inventory).filter_by(character_id=character.id).all()
+                        for inv in inventory_items:
+                            item = session.query(Item).filter_by(id=inv.item_id).first()
+                            if item:
+                                # Check if the item names are similar (case insensitive partial match)
+                                if item_name.lower() in item.name.lower() or item.name.lower() in item_name.lower():
+                                    print(f"Character already has similar item '{item.name}', skipping creation")
+                                    # The session is committed automatically in session_scope
+                                    # Remove the transaction tag from the response
+                                    ai_response = re.sub(pattern, '', ai_response).strip()
+                                    return ai_response
                 
-                # Get the current character from the database
-                current_character = session.query(character.__class__).filter_by(id=character.id).first()
-                
-                if not current_character:
-                    print(f"Character not found in database: {character.id}")
-                    return ai_response
-                
-                # Check if character has enough money
-                if current_character.money < amount:
-                    print(f"Character does not have enough money: {current_character.money} < {amount}")
-                    # Remove the transaction tag but don't process the transaction
-                    ai_response = re.sub(pattern, '', ai_response).strip()
-                    return ai_response
-                
-                # Deduct money from character
-                current_character.money -= amount
-                session.commit()
-                
-                print(f"Transaction successful. Character money reduced from {current_character.money + amount} to {current_character.money}")
+                # Session is automatically committed by the context manager
+                print(f"Transaction successful. Character money reduced to {current_character.money}")
                 
             except Exception as e:
                 print(f"Error processing transaction: {str(e)}")
@@ -949,7 +984,6 @@ Write a brief but compelling character backstory in 3-4 sentences maximum."""
     def _process_reward(self, ai_response, character):
         """Process monetary rewards from AI response"""
         import re
-        from ..db import Session
         
         # Look for reward tag pattern
         pattern = r'\[REWARD:(.*?)\|(.*?)\]'
@@ -970,21 +1004,20 @@ Write a brief but compelling character backstory in 3-4 sentences maximum."""
                 
                 print(f"Processing reward: {description} for {amount} pesos")
                 
-                # Create a database session
-                session = Session()
+                # Use session context manager
+                with session_scope() as session:
+                    # Get the current character from the database
+                    current_character = session.query(character.__class__).filter_by(id=character.id).first()
+                    
+                    if not current_character:
+                        print(f"Character not found in database: {character.id}")
+                        return ai_response
+                    
+                    # Add money to character
+                    current_character.money += amount
+                    # Session is committed automatically in session_scope
                 
-                # Get the current character from the database
-                current_character = session.query(character.__class__).filter_by(id=character.id).first()
-                
-                if not current_character:
-                    print(f"Character not found in database: {character.id}")
-                    return ai_response
-                
-                # Add money to character
-                current_character.money += amount
-                session.commit()
-                
-                print(f"Reward successful. Character money increased from {current_character.money - amount} to {current_character.money}")
+                print(f"Reward successful. Character money increased to {current_character.money}")
                 
             except Exception as e:
                 print(f"Error processing reward: {str(e)}")

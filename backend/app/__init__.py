@@ -14,7 +14,20 @@ def create_app():
     app = Flask(__name__)
     
     # Configure CORS
-    CORS(app, origins="http://localhost:3000", supports_credentials=True)
+    CORS(app, 
+         resources={r"/api/*": {"origins": ["http://localhost:3000", "http://127.0.0.1:3000"]}},
+         supports_credentials=True,
+         allow_headers=["Content-Type", "Authorization", "Access-Control-Allow-Credentials", "Accept"],
+         methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"])
+    
+    # Add CORS headers manually for OPTIONS requests
+    @app.after_request
+    def after_request(response):
+        response.headers.add('Access-Control-Allow-Origin', 'http://localhost:3000')
+        response.headers.add('Access-Control-Allow-Headers', 'Content-Type,Authorization')
+        response.headers.add('Access-Control-Allow-Methods', 'GET,PUT,POST,DELETE,OPTIONS')
+        response.headers.add('Access-Control-Allow-Credentials', 'true')
+        return response
     
     # Configure database
     app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///emerald_altar.db'
