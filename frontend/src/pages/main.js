@@ -17,9 +17,11 @@ function Main() {
   const [equippedItems, setEquippedItems] = useState([]);
   const [selectedItem, setSelectedItem] = useState(null);
   const [showItemModal, setShowItemModal] = useState(false);
+  const [hpChange, setHpChange] = useState(null);
   const chatEndRef = useRef(null);
   const { userId } = useParams();
   const navigate = useNavigate();
+  const [pendingItems, setPendingItems] = useState([]);
   
   
   const rollDice = (sides) => {
@@ -201,7 +203,8 @@ function Main() {
           }
           
           const characterData = await characterResponse.json();
-          console.log('Character data:', characterData);
+          console.log('Initial character data loaded:', characterData);
+          console.log('Character avatar URL:', characterData.avatar_url);
           
           // If class_id exists but class_ data doesn't have moves, fetch them separately
           if (characterData.class_id && (!characterData.class_ || !characterData.class_.moves)) {
@@ -324,6 +327,112 @@ function Main() {
     fetchData();
   }, [userId]);
   
+  // Function to parse AI messages for potential items
+  const parseItemSuggestions = (message) => {
+    if (!message || !message.content || typeof message.content !== 'string') return;
+    
+    // Look for the format created by our backend: (You can acquire the ItemName if you'd like)
+    const regex = /\(You can acquire the ([\w\s'\-]+) if you'd like\)/g;
+    let match;
+    const foundItems = [];
+    
+    // Find all matches in the message
+    while ((match = regex.exec(message.content)) !== null) {
+      foundItems.push(match[1].trim());
+    }
+    
+    if (foundItems.length > 0) {
+      console.log("Found suggested items in message:", foundItems);
+      
+      // Get details of these items from the backend
+      fetchSuggestedItems(foundItems);
+    }
+  };
+  
+  // Function to fetch item details from backend
+  const fetchSuggestedItems = async (itemNames) => {
+    if (!character || itemNames.length === 0) return;
+    
+    try {
+      const token = localStorage.getItem('token');
+      
+      // We need to find items in the backend that match these names
+      const response = await fetch(`http://127.0.0.1:5000/api/items`, {
+        headers: {
+          'Authorization': `Bearer ${token}`,
+          'Accept': 'application/json'
+        }
+      });
+      
+      if (response.ok) {
+        const allItems = await response.json();
+        
+        // Filter items that match our suggested item names
+        const matchedItems = allItems.filter(item => {
+          return itemNames.some(name => 
+            item.name.toLowerCase().includes(name.toLowerCase()) || 
+            name.toLowerCase().includes(item.name.toLowerCase())
+          );
+        });
+        
+        if (matchedItems.length > 0) {
+          console.log("Found matching items in database:", matchedItems);
+          setPendingItems(matchedItems);
+        }
+      }
+    } catch (err) {
+      console.error("Error fetching suggested items:", err);
+    }
+  };
+  
+  // Function to handle acquiring an item
+  const handleAcquireItem = async (e, item) => {
+    e.stopPropagation(); // Prevent other click handlers
+    
+    if (!item || !character) return;
+    
+    try {
+      const token = localStorage.getItem('token');
+      
+      const response = await fetch(`http://127.0.0.1:5000/api/items/${item.id}/acquire`, {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${token}`,
+          'Content-Type': 'application/json',
+          'Accept': 'application/json'
+        },
+        body: JSON.stringify({
+          character_id: character.id
+        })
+      });
+      
+      if (response.ok) {
+        const result = await response.json();
+        console.log('Acquire result:', result);
+        
+        // Remove the acquired item from pending items
+        setPendingItems(current => current.filter(i => i.id !== item.id));
+        
+        // Refresh inventory
+        const inventoryResponse = await fetch(`http://127.0.0.1:5000/api/characters/${character.id}/inventory`, {
+          headers: {
+            'Authorization': `Bearer ${token}`,
+            'Accept': 'application/json'
+          }
+        });
+        
+        if (inventoryResponse.ok) {
+          const inventoryData = await inventoryResponse.json();
+          setInventoryItems(inventoryData);
+        }
+      } else {
+        console.error('Failed to acquire item:', response.status);
+      }
+    } catch (err) {
+      console.error('Error acquiring item:', err);
+    }
+  };
+  
   // Handle chat submission
   const handleChatSubmit = async (e) => {
     e.preventDefault();
@@ -378,54 +487,43 @@ function Main() {
         })
       });
       
+      // Once we get a response, parse it for item suggestions
       if (aiResponse.ok) {
         const aiData = await aiResponse.json();
-        // AI message will be added to chat history, refresh chat messages
-        const chatHistoryResponse = await fetch(`http://127.0.0.1:5000/api/characters/${character.id}/chat`, {
-          headers: {
-            'Authorization': `Bearer ${token}`,
-            'Accept': 'application/json'
-          }
-        });
+        const aiMessage = {
+          content: aiData.content,
+          is_user: false,
+          timestamp: new Date().toISOString()
+        };
         
-        if (chatHistoryResponse.ok) {
-          const chatData = await chatHistoryResponse.json();
-          setChatMessages(chatData);
+        setChatMessages(prev => [...prev, aiMessage]);
+        
+        // Parse the AI response for any suggested items
+        parseItemSuggestions(aiMessage);
+        
+        // Check for damage indications in the message
+        if (aiMessage.content.includes("damage") || aiMessage.content.includes("healing") || 
+            aiMessage.content.includes("attack") || aiMessage.content.includes("hit") ||
+            aiMessage.content.includes("Current HP:")) {
+            
+            // Refresh character data to update HP status
+            await refreshCharacterData();
         }
       } else {
-        console.error('Failed to get AI response:', aiResponse.status);
-        
-        // Add a system message to inform the user about rate limiting
-        if (aiResponse.status === 429) {
-          // Add a rate limit message
-          const rateLimitMessage = {
-            content: "The AI is currently experiencing high demand. Please wait a moment before sending another message.",
-            is_user: false,
-            timestamp: new Date().toISOString()
-          };
-          setChatMessages(prev => [...prev, rateLimitMessage]);
-        } else {
-          // Add a generic error message
-          const errorMessage = {
-            content: "I'm having trouble responding right now. Please try again in a moment.",
-            is_user: false,
-            timestamp: new Date().toISOString()
-          };
-          setChatMessages(prev => [...prev, errorMessage]);
-        }
+        throw new Error('Failed to get AI response');
       }
       
-    } catch (err) {
-      console.error('Error sending message:', err);
+      setIsAiResponding(false);
+    } catch (error) {
+      console.error("Chat error:", error);
+      setIsAiResponding(false);
+      
       // Add error message to chat
-      const errorMessage = {
-        content: "There was an error sending your message. Please try again.",
+      setChatMessages(prev => [...prev, {
+        content: "Sorry, I'm having trouble connecting at the moment. Please try again.",
         is_user: false,
         timestamp: new Date().toISOString()
-      };
-      setChatMessages(prev => [...prev, errorMessage]);
-    } finally {
-      setIsAiResponding(false);
+      }]);
     }
   };
   
@@ -585,6 +683,181 @@ function Main() {
     }
   };
 
+  // Add function to handle dropping items from inventory
+  const handleDropItem = async (e, item) => {
+    e.stopPropagation(); // Prevent opening the modal
+    
+    // Confirm with the user before dropping
+    if (!window.confirm(`Are you sure you want to drop ${item.name}?`)) {
+      return;
+    }
+    
+    if (!item || !character) {
+      console.error("Cannot drop: No item or character");
+      return;
+    }
+    
+    console.log("Dropping item:", item);
+    console.log("Character ID:", character.id);
+    
+    try {
+      const token = localStorage.getItem('token');
+      console.log("Using token:", token ? "Token exists" : "No token found");
+      
+      const response = await fetch(`http://127.0.0.1:5000/api/items/${item.id}/drop`, {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${token}`,
+          'Content-Type': 'application/json',
+          'Accept': 'application/json'
+        },
+        body: JSON.stringify({
+          character_id: character.id
+        })
+      });
+      
+      console.log("Drop response status:", response.status);
+      
+      if (response.ok) {
+        const result = await response.json();
+        console.log('Drop result:', result);
+        
+        // If the item was the selected item, close the modal
+        if (selectedItem && selectedItem.id === item.id) {
+          setShowItemModal(false);
+          setSelectedItem(null);
+        }
+        
+        // Refresh inventory and equipment lists
+        const inventoryResponse = await fetch(`http://127.0.0.1:5000/api/characters/${character.id}/inventory`, {
+          headers: {
+            'Authorization': `Bearer ${token}`,
+            'Accept': 'application/json'
+          }
+        });
+        
+        if (inventoryResponse.ok) {
+          const inventoryData = await inventoryResponse.json();
+          setInventoryItems(inventoryData);
+        }
+        
+        const equipmentResponse = await fetch(`http://127.0.0.1:5000/api/characters/${character.id}/equipment`, {
+          headers: {
+            'Authorization': `Bearer ${token}`,
+            'Accept': 'application/json'
+          }
+        });
+        
+        if (equipmentResponse.ok) {
+          const equipmentData = await equipmentResponse.json();
+          setEquippedItems(equipmentData);
+        }
+      } else {
+        console.error('Failed to drop item:', response.status);
+        // Try to get the error message from the response
+        try {
+          const errorData = await response.json();
+          console.error('Error details:', errorData);
+        } catch (err) {
+          console.error('Could not parse error response');
+        }
+      }
+    } catch (err) {
+      console.error('Error dropping item:', err);
+    }
+  };
+
+  // Add function to calculate HP color class based on percentage
+  const getHpColorClass = (current, max) => {
+    if (!current || !max) return '';
+    const percentage = (current / max) * 100;
+    if (percentage <= 25) return 'critical-hp';
+    if (percentage <= 50) return 'low-hp';
+    return '';
+  };
+
+  const refreshCharacterData = async () => {
+    try {
+      const token = localStorage.getItem('token');
+      if (!token || !character) return;
+      
+      console.log("Refreshing character data after possible combat...");
+      console.log("Current character before refresh:", character);
+      
+      const characterResponse = await fetch(`http://127.0.0.1:5000/api/characters/${character.id}`, {
+        headers: {
+          'Authorization': `Bearer ${token}`,
+          'Accept': 'application/json'
+        }
+      });
+      
+      if (characterResponse.ok) {
+        const characterData = await characterResponse.json();
+        console.log('Raw updated character data from API:', characterData);
+        
+        // Explicitly preserve avatar_url
+        if (!characterData.avatar_url && character.avatar_url) {
+          console.log('Avatar URL missing in response, preserving existing:', character.avatar_url);
+          characterData.avatar_url = character.avatar_url;
+        }
+        
+        // Ensure class data and other important fields are preserved
+        if (!characterData.class_ && character.class_) {
+          console.log('Class data missing in response, preserving existing class data');
+          characterData.class_ = character.class_;
+        }
+        
+        // Check if this is a response from the damage endpoint
+        if (characterData.damage_info) {
+          console.log('Damage info detected:', characterData.damage_info);
+          
+          // Calculate HP change to show animation
+          const damageAmount = characterData.damage_info.damage_amount;
+          const healingAmount = characterData.damage_info.healing_amount;
+          
+          if (damageAmount > 0) {
+            setHpChange({
+              value: damageAmount,
+              isHealing: false
+            });
+          } else if (healingAmount > 0) {
+            setHpChange({
+              value: healingAmount,
+              isHealing: true
+            });
+          }
+          
+          // Remove the damage_info property before setting the character state
+          delete characterData.damage_info;
+          
+          // Clear the HP change indicator after animation
+          setTimeout(() => {
+            setHpChange(null);
+          }, 1000);
+        } else {
+          // Regular character update after AI response
+          if (character.hp_status !== characterData.hp_status) {
+            const diff = characterData.hp_status - character.hp_status;
+            setHpChange({
+              value: Math.abs(diff),
+              isHealing: diff > 0
+            });
+            
+            // Clear the HP change indicator after animation
+            setTimeout(() => {
+              setHpChange(null);
+            }, 1000);
+          }
+        }
+        
+        console.log('Final character data after processing:', characterData);
+        setCharacter(characterData);
+      }
+    } catch (error) {
+      console.error("Error refreshing character data:", error);
+    }
+  };
+
   // Render tabs content
   const renderTabContent = () => {
     switch (activeTab) {
@@ -636,6 +909,40 @@ function Main() {
             <div className="inventory-money">
               <span className="money-icon">💰</span> {character?.money || 0} pesos
             </div>
+            
+            {/* Display pending items that can be acquired */}
+            {pendingItems.length > 0 && (
+              <div className="pending-items">
+                <h4 style={{ marginTop: '1rem' }}>Items Available to Acquire:</h4>
+                {pendingItems.map(item => (
+                  <div 
+                    key={`pending-${item.id}`} 
+                    className="inventory-item"
+                    onClick={() => handleItemClick(item)}
+                  >
+                    <div className="item-header">
+                      <h5>{item.name}</h5>
+                      <span className="item-type">{item.type}</span>
+                    </div>
+                    <p className="item-description">{item.effect_description}</p>
+                    {item.armor_class > 0 && <div className="item-stat">Armor: +{item.armor_class}</div>}
+                    {item.str > 0 && <div className="item-stat">STR: +{item.str}</div>}
+                    {item.dex > 0 && <div className="item-stat">DEX: +{item.dex}</div>}
+                    {item.constitution > 0 && <div className="item-stat">CON: +{item.constitution}</div>}
+                    {item.intelligence > 0 && <div className="item-stat">INT: +{item.intelligence}</div>}
+                    {item.wisdom > 0 && <div className="item-stat">WIS: +{item.wisdom}</div>}
+                    {item.charisma > 0 && <div className="item-stat">CHA: +{item.charisma}</div>}
+                    <button 
+                      className="acquire-button"
+                      onClick={(e) => handleAcquireItem(e, item)}
+                    >
+                      Acquire
+                    </button>
+                  </div>
+                ))}
+              </div>
+            )}
+            
             {inventoryItems.length > 0 ? (
               <div className="inventory-items">
                 {inventoryItems.map(item => (
@@ -664,11 +971,17 @@ function Main() {
                         {item.is_equipped ? "Unequip" : "Equip"}
                       </button>
                     )}
+                    <button 
+                      className="drop-button-list"
+                      onClick={(e) => handleDropItem(e, item)}
+                    >
+                      Drop
+                    </button>
                   </div>
                 ))}
               </div>
             ) : (
-              <p>You don't have any items yet.</p>
+              <p>Your inventory is empty.</p>
             )}
           </div>
         );
@@ -701,6 +1014,12 @@ function Main() {
                       onClick={(e) => handleEquipItemFromList(e, item)}
                     >
                       Unequip
+                    </button>
+                    <button 
+                      className="drop-button-list"
+                      onClick={(e) => handleDropItem(e, item)}
+                    >
+                      Drop
                     </button>
                   </div>
                 ))}
@@ -792,7 +1111,15 @@ function Main() {
         {character ? (
           <div className="character-info">
             <div className="character-avatar">
-              <img src={character.avatar_url} alt={character.name} />
+              {console.log('Character avatar URL:', character.avatar_url)}
+              <img 
+                src={character.avatar_url || 'https://placehold.co/150x150/333/50C878?text=No+Avatar'} 
+                alt={character.name} 
+                onError={(e) => {
+                  console.error('Failed to load avatar image:', e);
+                  e.target.src = 'https://placehold.co/150x150/333/50C878?text=No+Avatar';
+                }}
+              />
             </div>
             <h2>{character.name}</h2>
             <div className="character-level-container">
@@ -804,11 +1131,16 @@ function Main() {
             {character.description && <p className="character-description">"{character.description}"</p>}
             
             <div className="character-stats">
-              <div className="stat">
+              <div className="stat hp-stat">
                 <span>HP</span>
+                {hpChange && (
+                  <div className={`${hpChange.isHealing ? 'healing-indicator' : 'damage-indicator'}`}>
+                    {hpChange.isHealing ? '+' : '-'}{hpChange.value}
+                  </div>
+                )}
                 <div className="progress-bar">
                   <div 
-                    className="progress" 
+                    className={`hp-progress ${getHpColorClass(character.hp_status, character.class_?.hp)}`}
                     style={{ width: `${(character.hp_status / character.class_?.hp) * 100}%` }}
                   ></div>
                 </div>
@@ -1110,6 +1442,12 @@ function Main() {
                 onClick={handleEquipItem}
               >
                 {selectedItem.is_equipped ? "Unequip" : "Equip"}
+              </button>
+              <button 
+                className="drop-button"
+                onClick={(e) => handleDropItem(e, selectedItem)}
+              >
+                Drop
               </button>
               <button className="close-button" onClick={handleCloseModal}>Close</button>
             </div>

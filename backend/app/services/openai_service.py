@@ -4,10 +4,13 @@ import requests
 import time
 import random
 import base64
+import uuid
+from pathlib import Path
 from datetime import datetime
 from dotenv import load_dotenv
 from ..models import Item, Inventory, Enemy, Move, NPC
 from ..db import Session, session_scope
+from flask_jwt_extended import create_access_token
 
 # Load environment variables from .env file
 load_dotenv()
@@ -52,8 +55,14 @@ class OpenAIService:
         # Add instruction for handling transactions
         system_prompt += "\n\nTRANSACTIONS: When the player purchases something, make sure to deduct the money from their wealth. Add a special tag with this format: [TRANSACTION:Amount|Description]. For example: [TRANSACTION:10|Purchase of leather boots]. Consider character's wealth before allowing expensive purchases."
         
-        # Add instruction for giving rewards
-        system_prompt += "\n\nREWARDS: When the player completes a quest or task and earns money, add this money to their wealth. Add a special tag with this format: [REWARD:Amount|Description]. For example: [REWARD:20|Completion of the temple quest]."
+        # Add instruction for combat damage
+        system_prompt += "\n\nDAMAGE: When the character takes damage in combat or from environmental hazards, add a damage tag at the end of your message: [DAMAGE:Amount|Source]. For example: [DAMAGE:5|Goblin attack]. Similarly, for healing: [HEALING:Amount|Source]."
+        
+        # Add instruction for damage dealt by player
+        system_prompt += "\n\nDAMAGE DEALT: When the character deals damage to enemies, ALWAYS add a damage dealt tag: [DAMAGE_DEALT:Amount|Target]. For example: [DAMAGE_DEALT:8|Goblin warrior]. Make sure to explicitly state all damage numbers in your narration."
+        
+        # Add instruction for MP usage
+        system_prompt += "\n\nMANA USAGE: Whenever the character uses a spell, ability, or any action that consumes mana or magical energy, add a mana usage tag: [MP_USED:Amount|Source]. For example: [MP_USED:15|Fireball spell]. Make sure to track the character's MP and don't allow them to cast spells if they have insufficient MP."
         
         # Check if this is the first message (no chat history)
         is_first_message = len(messages) == 0 or (len(messages) == 1 and messages[0].get('is_user', True))
@@ -130,6 +139,9 @@ class OpenAIService:
                         while re.search(reward_pattern, ai_response):
                             ai_response = self._process_reward(ai_response, character)
                         
+                        # Process damage
+                        ai_response = self._process_damage(ai_response, character)
+                        
                         # Process enemy creation
                         ai_response = self._process_enemy_creation(ai_response, character)
                         
@@ -187,6 +199,8 @@ The player you are interacting with is {character.name}, a {character.race} {cha
 Character Stats:
 - Level: {int(character.exp / 100) + 1}
 - Class: {character.class_.name if hasattr(character, 'class_') and character.class_ else 'Unknown'}
+- HP: {character.hp_status}/{character.class_.hp if hasattr(character, 'class_') and character.class_ else 100}
+- MP: {character.mp_status}/{character.class_.mp if hasattr(character, 'class_') and character.class_ else 100}
 - Money: {character.money} pesos
 - Background: {character.description if character.description else 'Unknown'}
 
@@ -206,6 +220,38 @@ You are responsible for managing:
 7. Item generation: Create usable, equipable, or lore-relevant items with names, descriptions, rarity, and stats. Each item will be visualized in high-quality 16-bit pixel art style with fine details, not simple 8-bit graphics.
 8. Database awareness: You can refer back to any characters, quests, items, or maps previously generated or stored.
 9. Story progression: You understand the overall plot of *Emerald Altar*, including the cursed emerald, spreading miasma, and citywide transformation.
+
+COMBAT AND DAMAGE SYSTEM:
+When in combat, calculate damage using these guidelines:
+- Weak enemies: 1-4 damage per hit
+- Standard enemies: 3-8 damage per hit
+- Strong enemies: 6-12 damage per hit
+- Boss enemies: 10-20 damage per hit
+
+Always track all damage in the battle with these tag patterns:
+- When a player takes damage: [DAMAGE:Amount|Source] (e.g., [DAMAGE:7|Cultist's dagger])
+- When a player deals damage: [DAMAGE_DEALT:Amount|Target] (e.g., [DAMAGE_DEALT:12|Zombie cultist])
+- When a player heals: [HEALING:Amount|Source] (e.g., [HEALING:10|Healing potion])
+
+EXPLICITLY note all damage dealt to and by the player in your narration, then include the appropriate tag to update the character stats. 
+Always report combat actions in detail, describing how much damage was dealt, by whom, and to whom.
+
+MANA AND MP SYSTEM:
+For spell casting and special abilities, track the MP cost:
+- When a player uses MP: [MP_USED:Amount|Source] (e.g., [MP_USED:15|Fireball spell])
+- Each class has different MP costs for their abilities
+- Basic abilities cost 5-10 MP
+- Intermediate abilities cost 15-25 MP
+- Advanced abilities cost 30-50 MP
+
+Always consider:
+- Character's armor class for hit probability
+- Character's attributes for damage modifiers
+- Environmental factors that might increase or decrease damage
+- Character's remaining MP for spell casting
+
+If the player's HP reaches 0, they become unconscious but not dead. Make this clear in your narration.
+If the player tries to use an ability with insufficient MP, inform them they cannot perform the action without enough magical energy.
 
 ITEMS AND EQUIPMENT:
 When creating items, be aware of these categories:
@@ -387,34 +433,18 @@ DO NOT include any explanations, only provide valid JSON."""
             item_type = match.group(2).strip()
             item_description = match.group(3).strip()
             
-            print(f"AI is giving item: {item_name} ({item_type}) - {item_description}")
+            print(f"AI is suggesting item: {item_name} ({item_type}) - {item_description}")
             
             try:
                 # Use session context manager
                 with session_scope() as session:
-                    # Check if character already has an item with this name or similar name
-                    # First, get all inventory items for the character
-                    inventory_items = session.query(Inventory).filter_by(character_id=character.id).all()
+                    # Check if an item with this name already exists in the database
+                    existing_item = session.query(Item).filter(Item.name.ilike(f"%{item_name}%")).first()
                     
-                    # Check if any of the inventory items have the same name or similar
-                    has_item = False
-                    for inv in inventory_items:
-                        item = session.query(Item).filter_by(id=inv.item_id).first()
-                        if item:
-                            # Check for exact match first
-                            if item.name.lower() == item_name.lower():
-                                print(f"Character already has item '{item_name}', skipping creation")
-                                has_item = True
-                                break
-                            
-                            # Check for partial match (if the name contains the other)
-                            if item_name.lower() in item.name.lower() or item.name.lower() in item_name.lower():
-                                print(f"Character already has similar item '{item.name}', skipping creation")
-                                has_item = True
-                                break
-                    
-                    # If the character doesn't have a similar item, create it
-                    if not has_item:
+                    if existing_item:
+                        print(f"Item with similar name '{existing_item.name}' already exists, using that")
+                        item_id = existing_item.id
+                    else:
                         # Create the new item
                         new_item = Item(
                             name=item_name,
@@ -445,87 +475,202 @@ DO NOT include any explanations, only provide valid JSON."""
                         
                         # Generate an image for the item
                         try:
-                            image_url = self.generate_item_image(item_name, item_type, item_description)
-                            if image_url:
-                                new_item.image_url = image_url
+                            image_path = self._generate_image(item_name, "item")
+                            if image_path:
+                                new_item.image_url = image_path
                         except Exception as img_err:
                             print(f"Error generating image for item: {str(img_err)}")
                         
                         # Add item to database and get its ID
                         session.add(new_item)
                         session.flush()  # Get ID without committing
+                        item_id = new_item.id
                         
-                        # Add item to character's inventory
-                        new_inventory = Inventory(
-                            item_id=new_item.id,
-                            character_id=character.id
-                        )
-                        
-                        session.add(new_inventory)
-                        # Session is committed automatically by the context manager
-                        
-                        print(f"Successfully added item {item_name} to character's inventory")
+                        print(f"Successfully created item {item_name} in the database")
+                    
+                    # Instead of adding directly to inventory, add a note about being able to acquire it
+                    # Remove the item tag and add a note that the item is available
+                    ai_response = re.sub(pattern, f"\n\n(You can acquire the {item_name} if you'd like)", ai_response).strip()
                 
             except Exception as e:
-                print(f"Error adding item to inventory: {str(e)}")
-            
-            # Remove the item tag from the response
-            ai_response = re.sub(pattern, '', ai_response).strip()
+                print(f"Error processing item: {str(e)}")
+                # Just remove the item tag without additional processing
+                ai_response = re.sub(pattern, '', ai_response).strip()
         
         return ai_response
     
-    def generate_item_image(self, item_name, item_type, item_description):
-        """Generate a 16-bit style image for an item using OpenAI's DALL-E model
+    def _generate_image(self, prompt, image_type="other"):
+        """Internal method to generate an image using DALL-E
         
         Args:
-            item_name: Name of the item
-            item_type: Type of the item (weapon, armor, etc.)
-            item_description: Description of the item
+            prompt: The text prompt to generate the image
+            image_type: Type of image ("avatar", "item", or "other")
             
         Returns:
-            URL of the generated image or None if generation failed
+            Path to the saved image or None if generation failed
         """
-        if not self.api_key:
-            print("Cannot generate image: OpenAI API key not set")
-            return None
-            
-        # Enhanced prompt for higher detail
-        prompt = f"A highly detailed 16-bit pixel art image of a fantasy RPG {item_type}: {item_name}. The item should have fine details, shading, and highlights with a colorful atmospheric background. High quality pixel art with detailed features, not 8-bit style. Make the background dark fantasy themed with mystic elements, not plain or transparent. Include Mesoamerican elements in the design."
+        # Initialize retry parameters
+        max_retries = 2
+        retry_count = 0
+        base_delay = 1
         
-        # Use the most minimal and reliable format for the API call
-        headers = {
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {self.api_key}"
-        }
+        # Add safety parameter and quality details
+        safety_prompt = prompt + " High quality 16-bit pixel art with fine details, not 8-bit style. Avoid any content that may be considered inappropriate or offensive."
         
-        data = {
-            "model": "dall-e-3",  # Use DALL-E 3 for higher quality
-            "prompt": prompt,
-            "n": 1,
-            "size": "1024x1024",
-            "quality": "hd"        # Request HD quality
-        }
-        
-        try:
-            print("Requesting item image generation...")
-            response = requests.post(
-                self.image_api_url,
-                headers=headers,
-                json=data
-            )
-            
-            if response.status_code == 200:
-                response_data = response.json()
-                image_url = response_data['data'][0]['url']
-                return image_url
-            else:
-                print(f"Error from OpenAI image API: {response.status_code}")
-                print(response.text)
-                return None
+        while retry_count <= max_retries:
+            try:
+                headers = {
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {self.api_key}"
+                }
                 
-        except Exception as e:
-            print(f"Exception when calling OpenAI image API: {str(e)}")
-            return None
+                # Try with DALL-E-3 first for high quality
+                data = {
+                    "model": "dall-e-3",
+                    "prompt": safety_prompt,
+                    "n": 1,
+                    "size": "1024x1024",
+                    "quality": "hd",
+                    "response_format": "url"
+                }
+                
+                print(f"Requesting image generation with DALL-E-3 (attempt {retry_count + 1}/{max_retries + 1})")
+                response = requests.post(
+                    self.image_api_url,
+                    headers=headers,
+                    json=data
+                )
+                
+                if response.status_code == 200:
+                    response_data = response.json()
+                    image_url = response_data['data'][0]['url']
+                    
+                    # Download the image
+                    image_response = requests.get(image_url)
+                    if image_response.status_code != 200:
+                        print(f"Failed to download image from {image_url}")
+                        return None
+                        
+                    # Create a unique filename
+                    unique_id = uuid.uuid4().hex[:10]
+                    if image_type == "avatar":
+                        folder = "avatars"
+                        filename = f"avatar_{unique_id}.png"
+                    elif image_type == "item":
+                        folder = "items"
+                        filename = f"item_{unique_id}.png"
+                    else:
+                        folder = "other"
+                        filename = f"image_{unique_id}.png"
+                    
+                    # Define path inside frontend public directory
+                    images_dir = Path(f"../frontend/public/images/{folder}")
+                    images_dir.mkdir(parents=True, exist_ok=True)
+                    
+                    image_path = images_dir / filename
+                    
+                    # Save the image
+                    with open(image_path, 'wb') as f:
+                        f.write(image_response.content)
+                        
+                    print(f"Image saved to {image_path}")
+                    
+                    # Return the URL path that will be accessible from frontend
+                    return f"/images/{folder}/{filename}"
+                    
+                elif response.status_code == 429 or "model is currently overloaded" in str(response.text):
+                    # Try with DALL-E-2 as fallback on rate limits or overload
+                    data = {
+                        "model": "dall-e-2",
+                        "prompt": safety_prompt,
+                        "n": 1,
+                        "size": "1024x1024",
+                        "response_format": "url"
+                    }
+                    
+                    print(f"Requesting fallback image generation with DALL-E-2 (attempt {retry_count + 1}/{max_retries + 1})")
+                    response = requests.post(
+                        self.image_api_url,
+                        headers=headers,
+                        json=data
+                    )
+                    
+                    if response.status_code == 200:
+                        response_data = response.json()
+                        image_url = response_data['data'][0]['url']
+                        
+                        # Download the image
+                        image_response = requests.get(image_url)
+                        if image_response.status_code != 200:
+                            print(f"Failed to download image from {image_url}")
+                            return None
+                            
+                        # Create a unique filename
+                        unique_id = uuid.uuid4().hex[:10]
+                        if image_type == "avatar":
+                            folder = "avatars"
+                            filename = f"avatar_{unique_id}.png"
+                        elif image_type == "item":
+                            folder = "items"
+                            filename = f"item_{unique_id}.png"
+                        else:
+                            folder = "other"
+                            filename = f"image_{unique_id}.png"
+                        
+                        # Define path inside frontend public directory
+                        images_dir = Path(f"../frontend/public/images/{folder}")
+                        images_dir.mkdir(parents=True, exist_ok=True)
+                        
+                        image_path = images_dir / filename
+                        
+                        # Save the image
+                        with open(image_path, 'wb') as f:
+                            f.write(image_response.content)
+                            
+                        print(f"Image saved to {image_path}")
+                        
+                        # Return the URL path that will be accessible from frontend
+                        return f"/images/{folder}/{filename}"
+                        
+                    elif response.status_code == 429:
+                        # Rate limit hit, apply exponential backoff
+                        if retry_count < max_retries:
+                            retry_count += 1
+                            delay = (2 ** retry_count) * base_delay + random.uniform(0.1, 0.5)
+                            print(f"Rate limit hit. Retrying in {delay:.2f} seconds...")
+                            time.sleep(delay)
+                            continue
+                        else:
+                            print(f"Rate limit error, max retries exceeded: {response.status_code}")
+                            print(response.text)
+                            return None
+                    else:
+                        print(f"Error from OpenAI image API (fallback): {response.status_code}")
+                        print(response.text)
+                        return None
+                else:
+                    print(f"Error from OpenAI image API: {response.status_code}")
+                    print(response.text)
+                    return None
+                    
+            except Exception as e:
+                print(f"Exception when calling OpenAI image API: {str(e)}")
+                
+                # Only retry on network-related errors
+                if isinstance(e, (requests.exceptions.ConnectionError, requests.exceptions.Timeout)):
+                    if retry_count < max_retries:
+                        retry_count += 1
+                        delay = (2 ** retry_count) * base_delay
+                        print(f"Network error. Retrying in {delay:.2f} seconds...")
+                        time.sleep(delay)
+                        continue
+                
+                return None
+            
+            # If we get here without continuing the loop, break out
+            break
+        
+        return None
     
     def generate_character_avatar(self, character_name, character_class, character_description):
         """Generate a 16-bit style avatar image for a character using OpenAI's DALL-E model
@@ -536,7 +681,7 @@ DO NOT include any explanations, only provide valid JSON."""
             character_description: Description of the character
             
         Returns:
-            URL of the generated image or None if generation failed
+            Path to the saved avatar image or None if generation failed
         """
         if not self.api_key:
             print("Cannot generate avatar: OpenAI API key not set")
@@ -570,7 +715,30 @@ DO NOT include any explanations, only provide valid JSON."""
             if response.status_code == 200:
                 response_data = response.json()
                 image_url = response_data['data'][0]['url']
-                return image_url
+                
+                # Download the image
+                image_response = requests.get(image_url)
+                if image_response.status_code != 200:
+                    print(f"Failed to download avatar from {image_url}")
+                    return None
+                    
+                # Create a unique filename
+                filename = f"avatar_{uuid.uuid4().hex[:10]}_{character_name.replace(' ', '_').lower()}.png"
+                
+                # Define path inside frontend public directory
+                images_dir = Path("../frontend/public/images/avatars")
+                images_dir.mkdir(parents=True, exist_ok=True)
+                
+                image_path = images_dir / filename
+                
+                # Save the image
+                with open(image_path, 'wb') as f:
+                    f.write(image_response.content)
+                    
+                print(f"Avatar saved to {image_path}")
+                
+                # Return the URL path that will be accessible from frontend
+                return f"/images/avatars/{filename}"
             else:
                 print(f"Error from OpenAI image API: {response.status_code}")
                 print(response.text)
@@ -637,112 +805,6 @@ Write a brief but compelling character backstory in 3-4 sentences maximum."""
             print(f"Exception when calling OpenAI API: {str(e)}")
             return None
     
-    def _generate_image(self, prompt):
-        """Internal method to generate an image using DALL-E
-        
-        Args:
-            prompt: The text prompt to generate the image
-            
-        Returns:
-            URL of the generated image or None if generation failed
-        """
-        # Initialize retry parameters
-        max_retries = 2
-        retry_count = 0
-        base_delay = 1
-        
-        # Add safety parameter and quality details
-        safety_prompt = prompt + " High quality 16-bit pixel art with fine details, not 8-bit style. Avoid any content that may be considered inappropriate or offensive."
-        
-        while retry_count <= max_retries:
-            try:
-                headers = {
-                    "Content-Type": "application/json",
-                    "Authorization": f"Bearer {self.api_key}"
-                }
-                
-                # Try with DALL-E-3 first for high quality
-                data = {
-                    "model": "dall-e-3",
-                    "prompt": safety_prompt,
-                    "n": 1,
-                    "size": "1024x1024",
-                    "quality": "hd",
-                    "response_format": "url"
-                }
-                
-                print(f"Requesting image generation with DALL-E-3 (attempt {retry_count + 1}/{max_retries + 1})")
-                response = requests.post(
-                    self.image_api_url,
-                    headers=headers,
-                    json=data
-                )
-                
-                if response.status_code == 200:
-                    response_data = response.json()
-                    image_url = response_data['data'][0]['url']
-                    return image_url
-                elif response.status_code == 429 or "model is currently overloaded" in str(response.text):
-                    # Try with DALL-E-2 as fallback on rate limits or overload
-                    data = {
-                        "model": "dall-e-2",
-                        "prompt": safety_prompt,
-                        "n": 1,
-                        "size": "1024x1024",
-                        "response_format": "url"
-                    }
-                    
-                    print(f"Requesting fallback image generation with DALL-E-2 (attempt {retry_count + 1}/{max_retries + 1})")
-                    response = requests.post(
-                        self.image_api_url,
-                        headers=headers,
-                        json=data
-                    )
-                    
-                    if response.status_code == 200:
-                        response_data = response.json()
-                        image_url = response_data['data'][0]['url']
-                        return image_url
-                    elif response.status_code == 429:
-                        # Rate limit hit, apply exponential backoff
-                        if retry_count < max_retries:
-                            retry_count += 1
-                            delay = (2 ** retry_count) * base_delay + random.uniform(0.1, 0.5)
-                            print(f"Rate limit hit. Retrying in {delay:.2f} seconds...")
-                            time.sleep(delay)
-                            continue
-                        else:
-                            print(f"Rate limit error, max retries exceeded: {response.status_code}")
-                            print(response.text)
-                            return None
-                    else:
-                        print(f"Error from OpenAI image API (fallback): {response.status_code}")
-                        print(response.text)
-                        return None
-                else:
-                    print(f"Error from OpenAI image API: {response.status_code}")
-                    print(response.text)
-                    return None
-                    
-            except Exception as e:
-                print(f"Exception when calling OpenAI image API: {str(e)}")
-                
-                # Only retry on network-related errors
-                if isinstance(e, (requests.exceptions.ConnectionError, requests.exceptions.Timeout)):
-                    if retry_count < max_retries:
-                        retry_count += 1
-                        delay = (2 ** retry_count) * base_delay
-                        print(f"Network error. Retrying in {delay:.2f} seconds...")
-                        time.sleep(delay)
-                        continue
-                
-                return None
-            
-            # If we get here without continuing the loop, break out
-            break
-        
-        return None
-
     def _process_enemy_creation(self, ai_response, character):
         """Process enemy creation from AI response"""
         import re
@@ -1024,6 +1086,165 @@ Write a brief but compelling character backstory in 3-4 sentences maximum."""
             
             # Remove the reward tag from the response
             ai_response = re.sub(pattern, '', ai_response).strip()
+        
+        return ai_response
+
+    def _process_damage(self, ai_response, character):
+        """Process damage or healing from AI response"""
+        import re
+        import requests
+        
+        # Look for damage tag pattern
+        damage_pattern = r'\[DAMAGE:(.*?)\|(.*?)\]'
+        damage_match = re.search(damage_pattern, ai_response)
+        
+        # Look for healing tag pattern
+        healing_pattern = r'\[HEALING:(.*?)\|(.*?)\]'
+        healing_match = re.search(healing_pattern, ai_response)
+        
+        # Look for MP usage pattern
+        mp_pattern = r'\[MP_USED:(.*?)\|(.*?)\]'
+        mp_match = re.search(mp_pattern, ai_response)
+        
+        # Look for damage dealt by player pattern
+        damage_dealt_pattern = r'\[DAMAGE_DEALT:(.*?)\|(.*?)\]'
+        damage_dealt_match = re.search(damage_dealt_pattern, ai_response)
+        
+        damage_amount = 0
+        healing_amount = 0
+        mp_amount = 0
+        damage_dealt_amount = 0
+        source = ""
+        target = ""
+        
+        if damage_match:
+            # Extract damage info
+            try:
+                damage_amount = int(damage_match.group(1).strip())
+                source = damage_match.group(2).strip()
+                
+                print(f"AI is dealing {damage_amount} damage from {source}")
+                
+                # Remove the damage tag from the response
+                ai_response = re.sub(damage_pattern, '', ai_response).strip()
+                
+            except ValueError:
+                print(f"Invalid damage amount: {damage_match.group(1)}")
+        
+        if healing_match:
+            # Extract healing info
+            try:
+                healing_amount = int(healing_match.group(1).strip())
+                source = healing_match.group(2).strip()
+                
+                print(f"AI is healing for {healing_amount} from {source}")
+                
+                # Remove the healing tag from the response
+                ai_response = re.sub(healing_pattern, '', ai_response).strip()
+                
+            except ValueError:
+                print(f"Invalid healing amount: {healing_match.group(1)}")
+                
+        if mp_match:
+            # Extract MP usage info
+            try:
+                mp_amount = int(mp_match.group(1).strip())
+                mp_source = mp_match.group(2).strip()
+                
+                print(f"AI is using {mp_amount} MP for {mp_source}")
+                
+                # Remove the MP tag from the response
+                ai_response = re.sub(mp_pattern, '', ai_response).strip()
+                
+            except ValueError:
+                print(f"Invalid MP amount: {mp_match.group(1)}")
+                
+        if damage_dealt_match:
+            # Extract damage dealt info
+            try:
+                damage_dealt_amount = int(damage_dealt_match.group(1).strip())
+                target = damage_dealt_match.group(2).strip()
+                
+                print(f"Player dealt {damage_dealt_amount} damage to {target}")
+                
+                # Remove the damage dealt tag from the response
+                ai_response = re.sub(damage_dealt_pattern, '', ai_response).strip()
+                
+            except ValueError:
+                print(f"Invalid damage dealt amount: {damage_dealt_match.group(1)}")
+        
+        # If we have damage, healing, MP, or damage dealt to process
+        if damage_amount > 0 or healing_amount > 0 or mp_amount > 0 or damage_dealt_amount > 0:
+            try:
+                # Get a valid token for the API request
+                with session_scope() as session:
+                    # Create a temporary token for the API call
+                    token = create_access_token(identity=character.id)
+                    
+                    # Make a request to the API to update character's HP and MP
+                    update_url = f"http://127.0.0.1:5000/api/characters/{character.id}/update-hp"
+                    headers = {
+                        "Content-Type": "application/json",
+                        "Accept": "application/json",
+                        "Authorization": f"Bearer {token}"
+                    }
+                    
+                    data = {
+                        "damage": damage_amount,
+                        "healing": healing_amount,
+                        "mp_used": mp_amount,
+                        "damage_dealt": damage_dealt_amount,
+                        "source": source,
+                        "target": target
+                    }
+                    
+                    response = requests.post(
+                        update_url,
+                        headers=headers,
+                        json=data
+                    )
+                
+                if response.status_code == 200:
+                    character_data = response.json()
+                    print(f"HP/MP update successful, received updated character data")
+                    
+                    # Extract the damage info
+                    damage_info = character_data.get('damage_info', {})
+                    is_dead = damage_info.get('is_dead', False)
+                    hp_status = damage_info.get('hp_status', 'unknown')
+                    mp_status = damage_info.get('mp_status', 'unknown')
+                    
+                    # If character died, add a note to the response
+                    if is_dead:
+                        ai_response += "\n\n(Your health has reached 0. You are unconscious and require healing or rest to continue.)"
+                    else:
+                        # Add the HP/MP change to the response
+                        response_notes = []
+                        
+                        # Report damage taken by player
+                        if damage_amount > 0:
+                            response_notes.append(f"You took {damage_amount} damage from {source}. Current HP: {hp_status}")
+                        
+                        # Report healing received by player
+                        elif healing_amount > 0:
+                            response_notes.append(f"You were healed for {healing_amount} from {source}. Current HP: {hp_status}")
+                        
+                        # Report MP used by player
+                        if mp_amount > 0:
+                            response_notes.append(f"You used {mp_amount} MP for {mp_source}. Current MP: {mp_status}")
+                            
+                        # Report damage dealt by player
+                        if damage_dealt_amount > 0:
+                            response_notes.append(f"You dealt {damage_dealt_amount} damage to {target}")
+                            
+                        if response_notes:
+                            ai_response += "\n\n(" + ". ".join(response_notes) + ")"
+                else:
+                    print(f"Failed to update HP/MP: {response.status_code}")
+                    print(response.text)
+                    
+            except Exception as e:
+                print(f"Error updating character HP/MP: {str(e)}")
         
         return ai_response
 
